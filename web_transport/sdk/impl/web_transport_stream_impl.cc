@@ -28,8 +28,17 @@ class WebTransportStreamVisitorAdapter
       : visitor_(visitor) {}
   void OnCanRead() override { visitor_->OnCanRead(); }
   void OnCanWrite() override { visitor_->OnCanWrite(); }
-  void OnResetStreamReceived(::quic::WebTransportStreamError error) override {}
-  void OnStopSendingReceived(::quic::WebTransportStreamError error) override {}
+  void OnResetStreamReceived(::quic::WebTransportStreamError error) override {
+    LOG(INFO)<<"OnResetStream received.";
+    if (visitor_) {
+      visitor_->OnResetStreamReceived(error);
+    }
+  }
+  void OnStopSendingReceived(::quic::WebTransportStreamError error) override {
+    if (visitor_) {
+      visitor_->OnStopSendingReceived(error);
+    }
+  }
   void OnWriteSideInDataRecvdState() override {}
 
  private:
@@ -45,7 +54,8 @@ WebTransportStreamImpl::WebTransportStreamImpl(
       quic_stream_(quic_stream),
       io_runner_(io_runner),
       event_runner_(event_runner),
-      visitor_(nullptr) {
+      visitor_(nullptr),
+      write_side_closed_(false) {
   CHECK(stream_);
   CHECK(quic_stream_);
   CHECK(io_runner_);
@@ -63,6 +73,9 @@ size_t WebTransportStreamImpl::Write(const uint8_t* data, size_t length) {
   DCHECK_EQ(sizeof(uint8_t), sizeof(char));
   CHECK(io_runner_);
   if (io_runner_->BelongsToCurrentThread()) {
+    if (write_side_closed_) {
+      return 0;
+    }
     return stream_->Write(
         absl::string_view(reinterpret_cast<const char*>(data), length));
   }
@@ -72,8 +85,12 @@ size_t WebTransportStreamImpl::Write(const uint8_t* data, size_t length) {
   io_runner_->PostTask(
       FROM_HERE,
       base::BindOnce(
-          [](WebTransportStreamImpl* stream, const uint8_t* data, size_t& length,
-             bool& result, base::WaitableEvent* event) {
+          [](base::WeakPtr<WebTransportStreamImpl> stream, const uint8_t* data,
+             size_t& length, bool& result, base::WaitableEvent* event) {
+            if (!stream || stream->write_side_closed_) {
+              event->Signal();
+              return;
+            }
             if (stream->stream_->CanWrite()) {
               result = stream->stream_->Write(absl::string_view(
                   reinterpret_cast<const char*>(data), length));
@@ -82,7 +99,7 @@ size_t WebTransportStreamImpl::Write(const uint8_t* data, size_t length) {
             }
             event->Signal();
           },
-          base::Unretained(this), base::Unretained(data), std::ref(length),
+          weak_factory_.GetWeakPtr(), base::Unretained(data), std::ref(length),
           std::ref(result), base::Unretained(&done)));
   done.Wait();
   return result ? length : 0;
@@ -106,15 +123,18 @@ size_t WebTransportStreamImpl::Read(uint8_t* data, size_t length) {
   io_runner_->PostTask(
       FROM_HERE,
       base::BindOnce(
-          [](WebTransportStreamImpl* stream, uint8_t* data, size_t& length,
-             size_t& result, base::WaitableEvent* event) {
+          [](base::WeakPtr<WebTransportStreamImpl> stream, uint8_t* data,
+             size_t& length, size_t& result, base::WaitableEvent* event) {
+            if (!stream) {
+              return;
+            }
             auto read_result =
                 stream->stream_->Read(reinterpret_cast<char*>(data), length);
             // TODO: FIN is not handled.
             result = read_result.bytes_read;
             event->Signal();
           },
-          base::Unretained(this), base::Unretained(data), std::ref(length),
+          weak_factory_.GetWeakPtr(), base::Unretained(data), std::ref(length),
           std::ref(result), base::Unretained(&done)));
   done.Wait();
   return result;
@@ -127,15 +147,18 @@ size_t WebTransportStreamImpl::ReadableBytes() const {
   size_t result;
   base::WaitableEvent done(base::WaitableEvent::ResetPolicy::AUTOMATIC,
                            base::WaitableEvent::InitialState::NOT_SIGNALED);
-  io_runner_->PostTask(
-      FROM_HERE,
-      base::BindOnce(
-          [](WebTransportStreamImpl const* stream, size_t& result,
-             base::WaitableEvent* event) {
-            result = stream->stream_->ReadableBytes();
-            event->Signal();
-          },
-          base::Unretained(this), std::ref(result), base::Unretained(&done)));
+  io_runner_->PostTask(FROM_HERE,
+                       base::BindOnce(
+                           [](base::WeakPtr<WebTransportStreamImpl> stream,
+                              size_t& result, base::WaitableEvent* event) {
+                             if (!stream) {
+                               return;
+                             }
+                             result = stream->stream_->ReadableBytes();
+                             event->Signal();
+                           },
+                           weak_factory_.GetWeakPtr(), std::ref(result),
+                           base::Unretained(&done)));
   done.Wait();
   return result;
 }
@@ -150,15 +173,18 @@ void WebTransportStreamImpl::Close() {
   base::WaitableEvent done(base::WaitableEvent::ResetPolicy::AUTOMATIC,
                            base::WaitableEvent::InitialState::NOT_SIGNALED);
   io_runner_->PostTask(
-      FROM_HERE,
-      base::BindOnce(
-          [](WebTransportStreamImpl* stream, base::WaitableEvent* event) {
-            if (!stream->stream_->SendFin()) {
-              LOG(ERROR) << "Failed to send FIN.";
-            }
-            event->Signal();
-          },
-          base::Unretained(this), base::Unretained(&done)));
+      FROM_HERE, base::BindOnce(
+                     [](base::WeakPtr<WebTransportStreamImpl> stream,
+                        base::WaitableEvent* event) {
+                       if (!stream) {
+                         return;
+                       }
+                       if (!stream->stream_->SendFin()) {
+                         LOG(ERROR) << "Failed to send FIN.";
+                       }
+                       event->Signal();
+                     },
+                     weak_factory_.GetWeakPtr(), base::Unretained(&done)));
   done.Wait();
 }
 
@@ -169,15 +195,18 @@ uint64_t WebTransportStreamImpl::BufferedDataBytes() const {
   uint64_t result;
   base::WaitableEvent done(base::WaitableEvent::ResetPolicy::AUTOMATIC,
                            base::WaitableEvent::InitialState::NOT_SIGNALED);
-  io_runner_->PostTask(
-      FROM_HERE,
-      base::BindOnce(
-          [](WebTransportStreamImpl const* stream, uint64_t& result,
-             base::WaitableEvent* event) {
-            result = stream->quic_stream_->BufferedDataBytes();
-            event->Signal();
-          },
-          base::Unretained(this), std::ref(result), base::Unretained(&done)));
+  io_runner_->PostTask(FROM_HERE,
+                       base::BindOnce(
+                           [](base::WeakPtr<WebTransportStreamImpl> stream,
+                              uint64_t& result, base::WaitableEvent* event) {
+                             if (!stream) {
+                               return;
+                             }
+                             result = stream->quic_stream_->BufferedDataBytes();
+                             event->Signal();
+                           },
+                           weak_factory_.GetWeakPtr(), std::ref(result),
+                           base::Unretained(&done)));
   done.Wait();
   return result;
 }
@@ -189,43 +218,44 @@ bool WebTransportStreamImpl::CanWrite() const {
   bool result;
   base::WaitableEvent done(base::WaitableEvent::ResetPolicy::AUTOMATIC,
                            base::WaitableEvent::InitialState::NOT_SIGNALED);
-  io_runner_->PostTask(
-      FROM_HERE,
-      base::BindOnce(
-          [](WebTransportStreamImpl const* stream, bool& result,
-             base::WaitableEvent* event) {
-            result = stream->stream_->CanWrite();
-            event->Signal();
-          },
-          base::Unretained(this), std::ref(result), base::Unretained(&done)));
+  io_runner_->PostTask(FROM_HERE,
+                       base::BindOnce(
+                           [](base::WeakPtr<WebTransportStreamImpl> stream,
+                              bool& result, base::WaitableEvent* event) {
+                             if (!stream) {
+                               return;
+                             }
+                             result = stream->stream_->CanWrite();
+                             event->Signal();
+                           },
+                           weak_factory_.GetWeakPtr(), std::ref(result),
+                           base::Unretained(&done)));
   done.Wait();
   return result;
 }
 
 void WebTransportStreamImpl::OnCanRead() {
-  event_runner_->PostTask(
-      FROM_HERE,
-      base::BindOnce(&WebTransportStreamImpl::OnCanReadOnCurrentThread,
-                     weak_factory_.GetWeakPtr()));
-}
-
-void WebTransportStreamImpl::OnCanWrite() {
-  event_runner_->PostTask(
-      FROM_HERE,
-      base::BindOnce(&WebTransportStreamImpl::OnCanWriteOnCurrentThread,
-                     weak_factory_.GetWeakPtr()));
-}
-
-void WebTransportStreamImpl::OnCanReadOnCurrentThread() {
   if (visitor_) {
     visitor_->OnCanRead();
   }
 }
 
-void WebTransportStreamImpl::OnCanWriteOnCurrentThread() {
+void WebTransportStreamImpl::OnCanWrite() {
   if (visitor_) {
     visitor_->OnCanWrite();
   }
+}
+
+void WebTransportStreamImpl::OnResetStreamReceived(
+    ::quic::WebTransportStreamError error) {
+  write_side_closed_ = true;
+}
+
+void WebTransportStreamImpl::OnStopSendingReceived(
+    ::quic::WebTransportStreamError error) {}
+
+void WebTransportStreamImpl::OnSessionClosed() {
+  write_side_closed_ = true;
 }
 
 }  // namespace quic
