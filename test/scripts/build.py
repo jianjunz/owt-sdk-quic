@@ -20,13 +20,15 @@ import zipfile
 import argparse
 
 SRC_PATH = Path(__file__).resolve().parents[3]
+NET_PATH = SRC_PATH/'net'
 PATCH_PATH = SRC_PATH/'owt'/'web_transport'/'patches'
 PACKAGE_PATH = SRC_PATH.parent/'packages'
 SDK_TARGETS = ['owt_web_transport']
 TEST_TARGETS = ['owt_web_transport_tests']
 TEST_TARGETS_WIN = ['owt_web_transport_dll_tests']
 PATCH_LIST = [
-    ('0001-Add-owt_web_transport-to-BUILD.gn.patch', SRC_PATH)
+    ('0001-Add-owt_web_transport-to-BUILD.gn.patch', SRC_PATH),
+    ('0002-Update-generate-certs.sh-to-use-ECDSA.patch', NET_PATH)
 ]
 GIT_BIN = 'git.bat' if sys.platform == 'win32' else 'git'
 
